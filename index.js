@@ -1,11 +1,68 @@
 "use strict";
 
-import { NativeModules, Platform } from "react-native";
-import semverLt from 'semver/functions/lt'
+import { Alert, NativeModules, Platform } from "react-native";
+import ReactNativeBlobUtil from "react-native-blob-util";
 
 const RNUpdateAPK = NativeModules.RNUpdateAPK;
 
-let jobId = -1;
+function semverLt(v1, v2) {
+  const parse = (v) => v.split(".").map(Number);
+  const [a1, b1, c1] = parse(v1);
+  const [a2, b2, c2] = parse(v2);
+
+  return (
+    a1 < a2 || (a1 === a2 && b1 < b2) || (a1 === a2 && b1 === b2 && c1 < c2)
+  );
+}
+
+function processFile(downloadDestPath, fileProviderAuthority, onError) {
+  RNUpdateAPK.getApkInfo(downloadDestPath)
+    .then((res) => {
+      console.log(
+        "RNUpdateAPK::downloadApk - Old Cert SHA-256: " +
+          RNUpdateAPK.signatures[0].thumbprint
+      );
+      console.log(
+        "RNUpdateAPK::downloadApk - New Cert SHA-256: " +
+          res.signatures[0].thumbprint
+      );
+      if (
+        res.signatures[0].thumbprint !== RNUpdateAPK.signatures[0].thumbprint
+      ) {
+        // FIXME should add extra callback for this
+        console.log(
+          "The signature thumbprints seem unequal. Install will fail"
+        );
+      } else {
+        if (!canRequestPackageInstalls()) {
+          Alert.alert(
+            "Enable Install Unknown Apps",
+            "To update, please enable 'Install unknown apps' for this app by clicking 'settings' on the next prompt.",
+            [
+              {
+                text: "OK",
+                onPress: () => {
+                  RNUpdateAPK.installApk(
+                    downloadDestPath,
+                    fileProviderAuthority
+                  );
+                },
+              },
+            ],
+            { cancelable: false }
+          );
+        } else {
+          RNUpdateAPK.installApk(downloadDestPath, fileProviderAuthority);
+        }
+      }
+    })
+    .catch((rej) => {
+      console.log("RNUpdateAPK::downloadApk - apk info error: ", rej);
+      onError && onError("Failed to get Downloaded APK Info");
+      // re-throw so we don't attempt to install the APK, this will call the downloadApkError handler
+      throw rej;
+    });
+}
 
 export class UpdateAPK {
   constructor(options) {
@@ -14,33 +71,28 @@ export class UpdateAPK {
 
   get = (url, success, error, options = {}) => {
     fetch(url, options)
-      .then(response => {
+      .then((response) => {
         if (!response.ok) {
           let message;
           if (response.statusText) {
-            message = `${response.url}  ${response.statusText}`
-          }
-          else {
-            message = `${response.url} Status Code:${response.status}`
+            message = `${response.url}  ${response.statusText}`;
+          } else {
+            message = `${response.url} Status Code:${response.status}`;
           }
           throw Error(message);
         }
         return response;
       })
-      .then(response => response.json())
-      .then(json => {
+      .then((response) => response.json())
+      .then((json) => {
         success && success(json);
       })
-      .catch(err => {
+      .catch((err) => {
         error && error(err);
       });
   };
 
-
   getApkVersion = () => {
-    if (jobId !== -1) {
-      return;
-    }
     if (!this.options.apkVersionUrl) {
       console.log("RNUpdateAPK::getApkVersion - apkVersionUrl doesn't exist.");
       return;
@@ -53,109 +105,100 @@ export class UpdateAPK {
     );
   };
 
-  getApkVersionSuccess = remote => {
-    console.log("getApkVersionSuccess", remote);
-    // TODO switch this to versionCode
+  getApkVersionSuccess = (remote) => {
     let outdated = false;
-    if (remote.versionCode && (remote.versionCode > RNUpdateAPK.versionCode)) {
-      console.log('RNUpdateAPK::getApkVersionSuccess - outdated based on code, local/remote: ' + RNUpdateAPK.versionCode + "/" + remote.versionCode);
+    if (remote.versionCode && remote.versionCode > RNUpdateAPK.versionCode) {
+      console.log(
+        "RNUpdateAPK::getApkVersionSuccess - outdated based on code, local/remote: " +
+          RNUpdateAPK.versionCode +
+          "/" +
+          remote.versionCode
+      );
       outdated = true;
     }
-    if (!remote.versionCode && semverLt(RNUpdateAPK.versionName, remote.versionName)) {
-      console.log('RNUpdateAPK::getApkVersionSuccess - APK outdated based on version name, local/remote: ' + RNUpdateAPK.versionName + "/" + remote.versionName);
-      outdated = true
+    if (
+      !remote.versionCode &&
+      semverLt(RNUpdateAPK.versionName, remote.versionName)
+    ) {
+      console.log(
+        "RNUpdateAPK::getApkVersionSuccess - APK outdated based on version name, local/remote: " +
+          RNUpdateAPK.versionName +
+          "/" +
+          remote.versionName
+      );
+      outdated = true;
     }
     if (outdated) {
-      if (remote.forceUpdate) {
-        if (this.options.forceUpdateApp) {
-          this.options.forceUpdateApp();
-        }
-        this.downloadApk(remote);
-      } else if (this.options.needUpdateApp) {
-        this.options.needUpdateApp(isUpdate => {
+      if (this.options.needUpdateApp) {
+        this.options.needUpdateApp((isUpdate) => {
           if (isUpdate) {
             this.downloadApk(remote);
           }
-        }, remote.whatsNew);
+        }, remote);
       }
     } else if (this.options.notNeedUpdateApp) {
       this.options.notNeedUpdateApp();
     }
   };
 
-  downloadApk = remote => {
-    const RNFS = require("react-native-fs");
-    const progress = data => {
-      const percentage = ((100 * data.bytesWritten) / data.contentLength) | 0;
-      this.options.downloadApkProgress &&
-        this.options.downloadApkProgress(percentage, data.contentLength, data.bytesWritten);
-    };
-    const begin = res => {
-      console.log("RNUpdateAPK::downloadApk - downloadApkStart");
-      this.options.downloadApkStart && this.options.downloadApkStart();
-    };
-    const progressDivider = 1;
+  downloadApk = async (remote) => {
     // You must be sure filepaths.xml exposes this path or you will have a FileProvider error API24+
     // You might check {totalSpace, freeSpace} = await RNFS.getFSInfo() to make sure there is room
-    const downloadDestPath = `${RNFS.CachesDirectoryPath}/NewApp.apk`;
+    const downloadDestPath = `${ReactNativeBlobUtil.fs.dirs.CacheDir}/SL.apk`;
+    const exists = await ReactNativeBlobUtil.fs.exists(downloadDestPath);
+    if (exists) {
+      try {
+        const info = await RNUpdateAPK.getApkInfo(downloadDestPath);
+        if (info.versionCode == remote.versionCode) {
+          console.log(
+            "RNUpdateAPK::downloadApk - APK already downloaded and up to date"
+          );
+          processFile(
+            downloadDestPath,
+            this.options.fileProviderAuthority,
+            this.options.onError
+          );
+          return;
+        } else {
+          console.log("APK exists but is outdated, removing");
+          await ReactNativeBlobUtil.fs.unlink(downloadDestPath);
+        }
+      } catch (e) {
+        console.log("Error with existing file, removing", e);
+        await ReactNativeBlobUtil.fs.unlink(downloadDestPath);
+      }
+    }
 
-    let options = this.options.apkOptions ? this.options.apkOptions : {};
+    const ret = ReactNativeBlobUtil.config({
+      path: downloadDestPath,
+    })
+      .fetch("GET", remote.apkUrl)
+      .progress((received, total) => {
+        const percentage = ((100 * received) / total).toFixed(2);
+        this.options.downloadApkProgress &&
+          this.options.downloadApkProgress(percentage);
+      });
 
-    const ret = RNFS.downloadFile(
-      Object.assign(
-        {
-          fromUrl: remote.apkUrl,
-          toFile: downloadDestPath,
-          begin,
-          progress,
-          background: true,
-          progressDivider
-        },
-        options
-      )
-    );
-
-    jobId = ret.jobId;
-
-    ret.promise
-      .then(res => {
-        if (res['statusCode'] >= 400 && res['statusCode'] <= 599) {
-          throw "Failed to Download APK. Server returned with " + res['statusCode'] + " statusCode";
+    ret
+      .then((res) => {
+        const status = res.info().status;
+        if (status >= 400 && status <= 599) {
+          throw (
+            "Failed to Download APK. Server returned with " +
+            status +
+            " statusCode"
+          );
         }
         console.log("RNUpdateAPK::downloadApk - downloadApkEnd");
         this.options.downloadApkEnd && this.options.downloadApkEnd();
-        RNUpdateAPK.getApkInfo(downloadDestPath)
-          .then(res => {
-            console.log(
-              "RNUpdateAPK::downloadApk - Old Cert SHA-256: " + RNUpdateAPK.signatures[0].thumbprint
-            );
-            console.log("RNUpdateAPK::downloadApk - New Cert SHA-256: " + res.signatures[0].thumbprint);
-            if (
-              res.signatures[0].thumbprint !==
-              RNUpdateAPK.signatures[0].thumbprint
-            ) {
-              // FIXME should add extra callback for this
-              console.log(
-                "The signature thumbprints seem unequal. Install will fail"
-              );
-            }
-          })
-          .catch(rej => {
-            console.log("RNUpdateAPK::downloadApk - apk info error: ", rej);
-            this.options.onError && this.options.onError("Failed to get Downloaded APK Info");
-            // re-throw so we don't attempt to install the APK, this will call the downloadApkError handler
-            throw rej;
-          });
-        RNUpdateAPK.installApk(
+        processFile(
           downloadDestPath,
-          this.options.fileProviderAuthority
+          this.options.fileProviderAuthority,
+          this.options.onError
         );
-
-        jobId = -1;
       })
-      .catch(err => {
+      .catch((err) => {
         this.downloadApkError(err);
-        jobId = -1;
       });
   };
 
@@ -173,9 +216,11 @@ export class UpdateAPK {
     );
   };
 
-  getAppStoreVersionSuccess = data => {
+  getAppStoreVersionSuccess = (data) => {
     if (data.resultCount < 1) {
-      console.log("RNUpdateAPK::getAppStoreVersionSuccess - iosAppId is wrong.");
+      console.log(
+        "RNUpdateAPK::getAppStoreVersionSuccess - iosAppId is wrong."
+      );
       return;
     }
     const result = data.results[0];
@@ -183,9 +228,14 @@ export class UpdateAPK {
     const trackViewUrl = result.trackViewUrl;
 
     if (semverLt(RNUpdateAPK.versionName, version)) {
-      console.log('RNUpdateAPK::getAppStoreVersionSuccess - outdated based on version name, local/remote: ' + RNUpdateAPK.versionName + "/" + version);
+      console.log(
+        "RNUpdateAPK::getAppStoreVersionSuccess - outdated based on version name, local/remote: " +
+          RNUpdateAPK.versionName +
+          "/" +
+          version
+      );
       if (this.options.needUpdateApp) {
-        this.options.needUpdateApp(isUpdate => {
+        this.options.needUpdateApp((isUpdate) => {
           if (isUpdate) {
             RNUpdateAPK.installFromAppStore(trackViewUrl);
           }
@@ -196,12 +246,12 @@ export class UpdateAPK {
     }
   };
 
-  getVersionError = err => {
+  getVersionError = (err) => {
     console.log("RNUpdateAPK::getVersionError - getVersionError", err);
     this.options.onError && this.options.onError(err);
   };
 
-  downloadApkError = err => {
+  downloadApkError = (err) => {
     console.log("RNUpdateAPK::downloadApkError - downloadApkError", err);
     this.options.onError && this.options.onError(err);
   };
@@ -236,17 +286,21 @@ export function getInstalledPackageInstaller() {
 export function getInstalledSigningInfo() {
   return RNUpdateAPK.signatures;
 }
+export function canRequestPackageInstalls() {
+  return RNUpdateAPK.canRequestPackageInstalls;
+}
+
 export async function getApps() {
   if (Platform.OS === "android") {
     return RNUpdateAPK.getApps();
   } else {
-    return Promise.resolve([]);
+    return [];
   }
 }
 export async function getNonSystemApps() {
   if (Platform.OS === "android") {
     return RNUpdateAPK.getNonSystemApps();
   } else {
-    return Promise.resolve([]);
+    return [];
   }
 }

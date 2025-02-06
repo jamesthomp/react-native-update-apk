@@ -58,6 +58,10 @@ public class RNUpdateAPK extends ReactContextBaseJavaModule {
             constants.put("lastUpdateTime", pInfo.lastUpdateTime);
             constants.put("packageInstaller", pManager.getInstallerPackageName(pInfo.packageName));
             constants.put("signatures", getPackageSignatureInfo(pInfo));
+            constants.put("canRequestPackageInstalls",
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                reactContext.checkSelfPermission(android.Manifest.permission.REQUEST_INSTALL_PACKAGES) == PackageManager.PERMISSION_GRANTED &&
+                pManager.canRequestPackageInstalls());
         } catch (PackageManager.NameNotFoundException e) {
             e.printStackTrace();
         }
