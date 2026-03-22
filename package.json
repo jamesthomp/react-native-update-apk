@@ -12,7 +12,10 @@
     "parryworld (https://github.com/parryworld)"
   ],
   "license": "MIT",
-  "dependencies": {
+  "peerDependencies": {
+    "react-native-blob-util": "*"
+  },
+  "devDependencies": {
     "react-native-blob-util": "^0.19.11"
   },
   "nativePackage": true,
